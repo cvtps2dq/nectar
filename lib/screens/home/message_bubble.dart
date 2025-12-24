@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/chat_provider.dart';
@@ -15,7 +17,10 @@ class MessageBubble extends StatelessWidget {
     final chat = context.read<ChatProvider>();
 
     return GestureDetector(
+      // Context Menu (Delete)
       onLongPressStart: (details) {
+        if (!isMe) return; // Only show menu for my messages
+
         final offset = details.globalPosition;
         showMenu(
           context: context,
@@ -26,24 +31,26 @@ class MessageBubble extends StatelessWidget {
             offset.dx,
             offset.dy,
           ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           items: [
-            if (isMe)
-              PopupMenuItem(
-                value: 'delete',
-                child: Row(
-                  children: const [
-                    Icon(Icons.delete, color: NeuColors.red),
-                    SizedBox(width: 8),
-                    Text(
-                      "Delete",
-                      style: TextStyle(color: NeuColors.textPrimary),
-                    ),
-                  ],
-                ),
+            PopupMenuItem(
+              value: 'delete',
+              child: Row(
+                children: const [
+                  Icon(Icons.delete_outline, color: NeuColors.red),
+                  SizedBox(width: 12),
+                  Text(
+                    "Delete Message",
+                    style: TextStyle(color: NeuColors.textPrimary),
+                  ),
+                ],
               ),
+            ),
           ],
-        ).then((v) {
-          if (v == 'delete') chat.deleteMessage(msg.uuid);
+        ).then((value) {
+          if (value == 'delete') {
+            chat.deleteMessage(msg.uuid);
+          }
         });
       },
       child: Padding(
@@ -54,30 +61,23 @@ class MessageBubble extends StatelessWidget {
               : MainAxisAlignment.start,
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            // Status Icon (Left side if mine, or hide)
+            // Status Icon (For my messages)
             if (isMe) ...[
               _buildStatusIcon(msg.status),
               const SizedBox(width: 8),
             ],
 
-            // The Bubble
+            // The Main Bubble
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 350),
               child: NeuBox(
-                // Me: Accent Color, Them: Surface Color
-                color: isMe ? NeuColors.surface : NeuColors.surface,
-
-                // Make "My" messages look slightly distinct via border or just alignment
-                // Actually, let's use Accent for "Me" but keep the neomorphism subtle
-                // Using a gradient or just text color is cleaner in dark mode.
-                // Let's stick to Surface for both but use Text Color to distinguish.
+                color: NeuColors.surface,
                 borderRadius: 16,
-                // Different corners
-                shape: BoxShape.rectangle,
                 padding: const EdgeInsets.all(12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // Sender Name (For incoming messages)
                     if (!isMe)
                       Padding(
                         padding: const EdgeInsets.only(bottom: 4),
@@ -90,7 +90,9 @@ class MessageBubble extends StatelessWidget {
                           ),
                         ),
                       ),
-                    _buildContent(msg),
+
+                    // Content (Text/Image/File)
+                    _buildContent(context, msg),
                   ],
                 ),
               ),
@@ -101,22 +103,76 @@ class MessageBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildContent(Message msg) {
+  Widget _buildContent(BuildContext context, Message msg) {
+    final chat = context.read<ChatProvider>();
+    final isMe = msg.isMine;
+
+    // 1. If it's Media
     if (msg.type == 'media') {
+      final String filename = msg.content.split('/').last;
+      final String localPath = "downloads/$filename";
+
       bool isImage =
-          msg.content.endsWith('.jpg') || msg.content.endsWith('.png');
+          filename.toLowerCase().endsWith('.jpg') ||
+          filename.toLowerCase().endsWith('.png') ||
+          filename.toLowerCase().endsWith('.jpeg') ||
+          filename.toLowerCase().endsWith('.gif');
+
       if (isImage) {
-        return ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Image.file(
-            File(msg.content),
-            height: 200,
-            fit: BoxFit.cover,
-            errorBuilder: (c, e, s) =>
-                const Icon(Icons.broken_image, color: NeuColors.red),
-          ),
-        );
+        // Check our in-memory cache
+        final imageData = chat.getMedia(localPath);
+
+        if (imageData != null) {
+          // A. Image is loaded, display it.
+          return ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.memory(imageData, height: 200, fit: BoxFit.cover),
+          );
+        } else {
+          // B. Image not loaded, show "Tap to load" placeholder.
+          return GestureDetector(
+            onTap: () {
+              print("[UI] Requesting media: $localPath");
+              chat.requestMedia(localPath);
+            },
+            child: Container(
+              height: 120,
+              width: 200,
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(
+                    Icons.downloading,
+                    color: NeuColors.accent,
+                    size: 32,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    "Tap to load image",
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: NeuColors.textSecondary,
+                    ),
+                  ),
+                  Text(
+                    filename,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: NeuColors.textSecondary,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
       } else {
+        // C. It's a generic file, not an image.
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -124,7 +180,7 @@ class MessageBubble extends StatelessWidget {
             const SizedBox(width: 8),
             Flexible(
               child: Text(
-                msg.content.split('/').last,
+                filename,
                 style: const TextStyle(color: NeuColors.textPrimary),
               ),
             ),
@@ -132,10 +188,14 @@ class MessageBubble extends StatelessWidget {
         );
       }
     }
+
+    // 2. If it's plain text
     return Text(
       msg.content,
       style: TextStyle(
-        color: msg.isMine ? NeuColors.accent : NeuColors.textPrimary,
+        color: isMe
+            ? NeuColors.textPrimary
+            : NeuColors.textPrimary, // Unified text color for dark mode
         fontSize: 15,
       ),
     );
@@ -150,11 +210,11 @@ class MessageBubble extends StatelessWidget {
         color = NeuColors.textSecondary;
         break;
       case MessageStatus.sent:
-        icon = Icons.check_circle;
+        icon = Icons.check_circle_outline;
         color = NeuColors.green;
         break;
       case MessageStatus.failed:
-        icon = Icons.error;
+        icon = Icons.error_outline;
         color = NeuColors.red;
         break;
       default:

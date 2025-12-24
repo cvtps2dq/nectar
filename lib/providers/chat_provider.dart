@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 import '../services/daemon_service.dart';
+import 'dart:convert';     // <--- ADD THIS for base64Decode
+import 'dart:typed_data'; // <--- ADD THIS for Uint8List
 
 enum AuthState { connecting, locked, setupNeeded, ready }
 enum MessageStatus { sending, sent, failed, received }
@@ -287,7 +289,15 @@ class ChatProvider extends ChangeNotifier {
         // Delete message
         String relatedUuid = payload['related_uuid'];
         _processDelete(sender, relatedUuid);
-      } 
+      } else if (type == 'file_data') {
+      // payload: { path: "...", data_b64: "..." }
+      String path = payload['path'];
+      String b64 = payload['data_b64'];
+      
+      // Decode and cache
+      _mediaCache[path] = base64Decode(b64);
+      notifyListeners();
+    }
       else {
         // Normal New Message
         final body = payload['body'] ?? "";
@@ -426,5 +436,12 @@ class ChatProvider extends ChangeNotifier {
     );
 
     unstageFile(); // Clear input
+  }
+
+  final Map<String, Uint8List> _mediaCache = {};
+  Uint8List? getMedia(String path) => _mediaCache[path];
+
+  void requestMedia(String path) {
+    _daemon.sendCommand('get_file', {'path': path});
   }
 }
