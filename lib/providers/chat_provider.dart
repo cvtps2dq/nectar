@@ -1,24 +1,36 @@
-import 'dart:async'; // <--- Import for Timer
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:uuid/uuid.dart';
 import '../services/daemon_service.dart';
 
 enum AuthState { connecting, locked, setupNeeded, ready }
+enum MessageStatus { sending, sent, failed, received }
 
 class Message {
+  final String uuid;      // Global ID
+  final String? replyTo;  // UUID of parent message
+  final String localId;   // Temporary tracking ID (optional now, but good for ACKs)
+  
   final String sender;
   final String content;
   final bool isMine;
   final bool isFile;
   final String timestamp;
-  final String type;
+  final String type;      // 'text', 'media', 'voice'
+  
+  MessageStatus status;   // Mutable to allow updates (Sending -> Sent)
 
   Message({
+    required this.uuid,
+    this.replyTo,
+    required this.localId,
     required this.sender,
     required this.content,
     required this.isMine,
     required this.isFile,
     required this.timestamp,
     required this.type,
+    required this.status,
   });
 }
 
@@ -31,11 +43,13 @@ class Contact {
 
 class ChatProvider extends ChangeNotifier {
   final DaemonService _daemon;
-  Timer? _connTimer; // <--- Timer to poll connection
+  final Uuid _uuidGen = const Uuid();
+  Timer? _connTimer;
 
   // Auth State
   AuthState authState = AuthState.connecting;
   String? authError;
+  String? globalError; // For Snackbars
 
   // User Info
   String myUsername = "Unknown";
@@ -48,6 +62,7 @@ class ChatProvider extends ChangeNotifier {
   List<String> get contactList => contacts.keys.toList()..sort();
 
   String? activeContactName;
+  bool _hasSynced = false;
 
   Contact? get activeContact {
     if (activeContactName != null && contacts.containsKey(activeContactName)) {
@@ -58,7 +73,6 @@ class ChatProvider extends ChangeNotifier {
 
   ChatProvider(this._daemon) {
     _daemon.events.listen(_handleEvent);
-    // Start polling immediately
     _startConnectionPolling();
   }
 
@@ -68,20 +82,30 @@ class ChatProvider extends ChangeNotifier {
     super.dispose();
   }
 
-  // --- Connection Polling ---
+  void clearError() {
+    globalError = null;
+    notifyListeners();
+  }
+
+  // --- ROBUST Connection Polling ---
   void _startConnectionPolling() {
     _connTimer?.cancel();
-
-    // Poll more frequently (200ms) during setup/unlock
-    _connTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
-      if (authState == AuthState.ready && myUsername != "Unknown") {
-        timer.cancel();
-      } else {
-        // Force a status check
+    _connTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+      if (authState != AuthState.ready) {
         _daemon.sendCommand('get_status', {});
-        // Also try to get self, just in case we missed the 'ready' event
-        if (authState != AuthState.locked) {
-          _daemon.sendCommand('get_self', {});
+        
+        // Race condition check: If daemon is ready but we missed the packet
+        if (authState != AuthState.connecting) {
+           _daemon.sendCommand('get_self', {});
+        }
+      } else {
+        // Logged in. Do we have data?
+        if (!_hasSynced) {
+          print("[Flutter] Requesting Sync...");
+          _daemon.sendCommand('sync_request', {});
+        } else {
+          // Heartbeat or stop
+          timer.cancel(); 
         }
       }
     });
@@ -92,23 +116,10 @@ class ChatProvider extends ChangeNotifier {
   void unlock(String password) {
     authError = null;
     notifyListeners();
-
-    // 1. Send Command
     _daemon.sendCommand('unlock', {'password': password});
-
-    // 2. Start Polling Status
-    // If the unlock succeeds, the status will change to 'ready'
-    // and _handleEvent will switch the UI.
-    _startConnectionPolling();
   }
 
-  void setup(
-    String username,
-    String password,
-    String ip,
-    String avatarPath,
-    String bio,
-  ) {
+  void setup(String username, String password, String ip, String avatarPath, String bio) {
     authError = null;
     notifyListeners();
     _daemon.sendCommand('setup', {
@@ -118,12 +129,8 @@ class ChatProvider extends ChangeNotifier {
       'avatar': avatarPath,
       'bio': bio,
     });
-
-    // Optimistic set
     myAvatar = avatarPath;
     myBio = bio;
-
-    _startConnectionPolling();
   }
 
   void setActiveContact(String name) {
@@ -135,33 +142,71 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void addContact(String username) {
-    // NEW: Send command to daemon to validate & persist
     _daemon.sendCommand('add_contact', {'username': username});
   }
 
-  void sendMessage(String text) {
+  void sendMessage(String text, {String? replyToUuid}) {
     if (activeContactName == null) return;
+    
+    // Generate IDs
+    String uuid = _uuidGen.v4();
+    String localId = "${DateTime.now().millisecondsSinceEpoch}-$uuid";
+
+    // Network
     _daemon.sendCommand('send_text', {
       'target': activeContactName,
       'text': text,
+      'uuid': uuid,
+      'reply_to': replyToUuid ?? "",
+      'local_id': localId
     });
 
-    // Optimistic update
+    // Optimistic UI
     _addMessage(
       activeContactName!,
       Message(
+        uuid: uuid,
+        replyTo: replyToUuid,
+        localId: localId,
         sender: "Me",
         content: text,
         isMine: true,
         isFile: false,
         timestamp: DateTime.now().toString(),
         type: 'text',
+        status: MessageStatus.sending, // Gray clock
       ),
     );
   }
 
+  void editMessage(String uuid, String newText) {
+    if (activeContactName == null) return;
+
+    _daemon.sendCommand('edit_msg', {
+      'target': activeContactName,
+      'uuid': uuid,
+      'text': newText
+    });
+
+    // Optimistic Update
+    _processEdit(activeContactName!, uuid, newText);
+  }
+
+  void deleteMessage(String uuid) {
+    if (activeContactName == null) return;
+
+    _daemon.sendCommand('delete_msg', {
+      'target': activeContactName,
+      'uuid': uuid
+    });
+
+    // Optimistic Delete
+    _processDelete(activeContactName!, uuid);
+  }
+
   void uploadFile(String path) {
     if (activeContactName == null) return;
+    // Note: File uploads handle their own messages via the Daemon for now
     _daemon.sendCommand('upload_file', {
       'target': activeContactName,
       'filepath': path,
@@ -174,60 +219,100 @@ class ChatProvider extends ChangeNotifier {
     final type = data['event'];
     final payload = data['payload'];
 
-    print("[Flutter] Recv Event: $type"); // Debug logging
+    // print("[Flutter] Event: $type"); // Uncomment for debugging
 
     if (type == 'status') {
       final status = payload['status'];
-
-      // Stop the polling timer since we got a response
-      _connTimer?.cancel();
-
-      if (status == 'locked')
-        authState = AuthState.locked;
-      else if (status == 'setup_needed')
-        authState = AuthState.setupNeeded;
+      AuthState newState = authState;
+      
+      if (status == 'locked') newState = AuthState.locked;
+      else if (status == 'setup_needed') newState = AuthState.setupNeeded;
       else if (status == 'ready') {
         if (payload['username'] != null) myUsername = payload['username'];
-        authState = AuthState.ready;
-        _daemon.sendCommand('get_self', {});
+        newState = AuthState.ready;
       }
+      
+      if (newState != authState) {
+        authState = newState;
+        notifyListeners();
+      }
+    } 
+    else if (type == 'auth_failed' || type == 'error') {
+      // General error handling
+      if (type == 'auth_failed') authError = payload['msg'];
+      else globalError = payload['msg'];
       notifyListeners();
-    } else if (type == 'auth_failed') {
-      authError = payload['msg'] ?? "Authentication Failed";
-      notifyListeners();
-    } else if (type == 'contact_added') {
+    } 
+    else if (type == 'contact_added') {
       String username = payload['username'];
       if (!contacts.containsKey(username)) {
         contacts[username] = Contact(username);
         setActiveContact(username);
         notifyListeners();
       }
-    } else if (type == 'ready') {
+    } 
+    else if (type == 'ready') {
       myUsername = payload['username'];
       myPubkey = payload['pubkey'];
       authState = AuthState.ready;
-      _daemon.sendCommand('sync_request', {});
       notifyListeners();
-    } else if (type == 'new_message') {
+    } 
+    else if (type == 'message_ack') {
+      // payload: { local_id: "...", status: "sent" }
+      String id = payload['local_id'];
+      String statusStr = payload['status'];
+      
+      // Update status
+      for (var c in contacts.values) {
+        for (var m in c.history) {
+          if (m.isMine && m.localId == id) {
+            m.status = (statusStr == "sent") ? MessageStatus.sent : MessageStatus.failed;
+            notifyListeners();
+            return;
+          }
+        }
+      }
+    }
+    else if (type == 'new_message') {
       final sender = payload['sender'];
-      final body = payload['body'] ?? "";
-      final msgType = payload['type'];
+      final eventType = payload['type']; // text, media, edit, delete
 
-      String content = body;
-      if (msgType == 'media') content = "downloads/${payload['filename']}";
+      if (eventType == 'edit') {
+        // Edit existing message
+        String relatedUuid = payload['related_uuid']; // ID of message to edit
+        String newBody = payload['body'];
+        _processEdit(sender, relatedUuid, newBody);
+      } 
+      else if (eventType == 'delete') {
+        // Delete message
+        String relatedUuid = payload['related_uuid'];
+        _processDelete(sender, relatedUuid);
+      } 
+      else {
+        // Normal New Message
+        final body = payload['body'] ?? "";
+        String content = body;
+        if (eventType == 'media') content = "downloads/${payload['filename']}";
 
-      _addMessage(
-        sender,
-        Message(
-          sender: sender,
-          content: content,
-          isMine: false,
-          isFile: msgType == 'media',
-          timestamp: payload['timestamp'].toString(),
-          type: msgType ?? 'text',
-        ),
-      );
-    } else if (type == 'sync_response') {
+        _addMessage(
+          sender,
+          Message(
+            uuid: payload['uuid'] ?? "", 
+            replyTo: payload['reply_to'],
+            localId: "", // Not needed for incoming
+            sender: sender,
+            content: content,
+            isMine: false,
+            isFile: eventType == 'media',
+            timestamp: payload['timestamp'].toString(),
+            type: eventType ?? 'text',
+            status: MessageStatus.received
+          ),
+        );
+      }
+    } 
+    else if (type == 'sync_response') {
+      _hasSynced = true;
       if (payload['contacts'] != null) {
         contacts.clear();
         for (var c in payload['contacts']) {
@@ -236,14 +321,19 @@ class ChatProvider extends ChangeNotifier {
 
           if (c['history'] != null) {
             for (var m in c['history']) {
+              bool isMine = m['is_mine'];
               contact.history.add(
                 Message(
+                  uuid: m['uuid'] ?? "", // Ensure Daemon exports this
+                  replyTo: m['reply_to'],
+                  localId: "synced",
                   sender: m['sender'],
                   content: m['content'],
-                  isMine: m['is_mine'],
+                  isMine: isMine,
                   isFile: m['type'] == 'media',
                   timestamp: m['timestamp'].toString(),
                   type: m['type'] ?? 'text',
+                  status: isMine ? MessageStatus.sent : MessageStatus.received,
                 ),
               );
             }
@@ -255,14 +345,86 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  // --- Internal Logic ---
+
   void _addMessage(String contactName, Message msg) {
     if (!contacts.containsKey(contactName)) {
       contacts[contactName] = Contact(contactName);
     }
     contacts[contactName]!.history.add(msg);
+    
     if (activeContactName != contactName && !msg.isMine) {
       contacts[contactName]!.unreadCount++;
     }
     notifyListeners();
+  }
+
+  void _processEdit(String contactName, String targetUuid, String newText) {
+    if (contacts.containsKey(contactName)) {
+      var history = contacts[contactName]!.history;
+      int idx = history.indexWhere((m) => m.uuid == targetUuid);
+      if (idx != -1) {
+        var old = history[idx];
+        history[idx] = Message(
+          uuid: old.uuid, replyTo: old.replyTo, localId: old.localId,
+          sender: old.sender, isMine: old.isMine, isFile: old.isFile,
+          timestamp: old.timestamp, type: old.type, status: old.status,
+          content: newText // Updated
+        );
+        notifyListeners();
+      }
+    }
+  }
+
+  void _processDelete(String contactName, String targetUuid) {
+    if (contacts.containsKey(contactName)) {
+      contacts[contactName]!.history.removeWhere((m) => m.uuid == targetUuid);
+      notifyListeners();
+    }
+  }
+
+  String? stagedFilepath;
+  String stagedCaption = "";
+
+  void stageFile(String path) {
+    stagedFilepath = path;
+    notifyListeners();
+  }
+
+  void unstageFile() {
+    stagedFilepath = null;
+    stagedCaption = "";
+    notifyListeners();
+  }
+
+  void sendStagedFile() {
+    if (activeContactName == null || stagedFilepath == null) return;
+    
+    // Pass caption to daemon
+    // NOTE: We need to update IPC `upload_file` to accept a caption!
+    _daemon.sendCommand('upload_file', {
+      'target': activeContactName,
+      'filepath': stagedFilepath,
+      'caption': stagedCaption
+    });
+
+    // Optimistic UI Update (Show file as sending)
+    _addMessage(
+      activeContactName!, 
+      Message(
+        uuid: const Uuid().v4(), 
+        localId: "${DateTime.now().millisecondsSinceEpoch}",
+        sender: "Me", 
+        // Use filename as content
+        content: stagedFilepath!.split('/').last, 
+        isMine: true, 
+        isFile: true, 
+        timestamp: DateTime.now().toString(), 
+        type: 'media', 
+        status: MessageStatus.sending
+      )
+    );
+
+    unstageFile(); // Clear input
   }
 }
