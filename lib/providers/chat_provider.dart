@@ -2,25 +2,27 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 import '../services/daemon_service.dart';
-import 'dart:convert';     // <--- ADD THIS for base64Decode
+import 'dart:convert'; // <--- ADD THIS for base64Decode
 import 'dart:typed_data'; // <--- ADD THIS for Uint8List
 
 enum AuthState { connecting, locked, setupNeeded, ready }
+
 enum MessageStatus { sending, sent, failed, received }
 
 class Message {
-  final String uuid;      // Global ID
-  final String? replyTo;  // UUID of parent message
-  final String localId;   // Temporary tracking ID (optional now, but good for ACKs)
-  
+  final String uuid; // Global ID
+  final String? replyTo; // UUID of parent message
+  final String
+  localId; // Temporary tracking ID (optional now, but good for ACKs)
+
   final String sender;
   final String content;
   final bool isMine;
   final bool isFile;
   final String timestamp;
-  final String type;      // 'text', 'media', 'voice'
-  
-  MessageStatus status;   // Mutable to allow updates (Sending -> Sent)
+  final String type; // 'text', 'media', 'voice'
+
+  MessageStatus status; // Mutable to allow updates (Sending -> Sent)
 
   Message({
     required this.uuid,
@@ -95,10 +97,10 @@ class ChatProvider extends ChangeNotifier {
     _connTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       if (authState != AuthState.ready) {
         _daemon.sendCommand('get_status', {});
-        
+
         // Race condition check: If daemon is ready but we missed the packet
         if (authState != AuthState.connecting) {
-           _daemon.sendCommand('get_self', {});
+          _daemon.sendCommand('get_self', {});
         }
       } else {
         // Logged in. Do we have data?
@@ -107,7 +109,7 @@ class ChatProvider extends ChangeNotifier {
           _daemon.sendCommand('sync_request', {});
         } else {
           // Heartbeat or stop
-          timer.cancel(); 
+          timer.cancel();
         }
       }
     });
@@ -121,7 +123,13 @@ class ChatProvider extends ChangeNotifier {
     _daemon.sendCommand('unlock', {'password': password});
   }
 
-  void setup(String username, String password, String ip, String avatarPath, String bio) {
+  void setup(
+    String username,
+    String password,
+    String ip,
+    String avatarPath,
+    String bio,
+  ) {
     authError = null;
     notifyListeners();
     _daemon.sendCommand('setup', {
@@ -149,10 +157,10 @@ class ChatProvider extends ChangeNotifier {
 
   void sendMessage(String text, {String? replyToUuid}) {
     if (activeContactName == null) return;
-    
+
     // Generate IDs
     String uuid = _uuidGen.v4();
-    String localId = "${DateTime.now().millisecondsSinceEpoch}-$uuid";
+    String localId = uuid;
 
     // Network
     _daemon.sendCommand('send_text', {
@@ -160,7 +168,7 @@ class ChatProvider extends ChangeNotifier {
       'text': text,
       'uuid': uuid,
       'reply_to': replyToUuid ?? "",
-      'local_id': localId
+      'local_id': localId, // Send the UUID
     });
 
     // Optimistic UI
@@ -187,7 +195,7 @@ class ChatProvider extends ChangeNotifier {
     _daemon.sendCommand('edit_msg', {
       'target': activeContactName,
       'uuid': uuid,
-      'text': newText
+      'text': newText,
     });
 
     // Optimistic Update
@@ -199,7 +207,7 @@ class ChatProvider extends ChangeNotifier {
 
     _daemon.sendCommand('delete_msg', {
       'target': activeContactName,
-      'uuid': uuid
+      'uuid': uuid,
     });
 
     // Optimistic Delete
@@ -226,102 +234,121 @@ class ChatProvider extends ChangeNotifier {
     if (type == 'status') {
       final status = payload['status'];
       AuthState newState = authState;
-      
-      if (status == 'locked') newState = AuthState.locked;
-      else if (status == 'setup_needed') newState = AuthState.setupNeeded;
+
+      if (status == 'locked')
+        newState = AuthState.locked;
+      else if (status == 'setup_needed')
+        newState = AuthState.setupNeeded;
       else if (status == 'ready') {
         if (payload['username'] != null) myUsername = payload['username'];
         newState = AuthState.ready;
       }
-      
+
       if (newState != authState) {
         authState = newState;
         notifyListeners();
       }
-    } 
-    else if (type == 'auth_failed' || type == 'error') {
+    } else if (type == 'auth_failed' || type == 'error') {
       // General error handling
-      if (type == 'auth_failed') authError = payload['msg'];
-      else globalError = payload['msg'];
+      if (type == 'auth_failed')
+        authError = payload['msg'];
+      else
+        globalError = payload['msg'];
       notifyListeners();
-    } 
-    else if (type == 'contact_added') {
+    } else if (type == 'contact_added') {
       String username = payload['username'];
       if (!contacts.containsKey(username)) {
         contacts[username] = Contact(username);
         setActiveContact(username);
         notifyListeners();
       }
-    } 
-    else if (type == 'ready') {
+    } else if (type == 'ready') {
       myUsername = payload['username'];
       myPubkey = payload['pubkey'];
       authState = AuthState.ready;
       notifyListeners();
-    } 
-    else if (type == 'message_ack') {
+    }
+    if (type == 'message_ack') {
       // payload: { local_id: "...", status: "sent" }
       String id = payload['local_id'];
       String statusStr = payload['status'];
-      
-      // Update status
-      for (var c in contacts.values) {
-        for (var m in c.history) {
-          if (m.isMine && m.localId == id) {
-            m.status = (statusStr == "sent") ? MessageStatus.sent : MessageStatus.failed;
-            notifyListeners();
-            return;
-          }
+
+      print(
+        "[Flutter] ACK Received for local_id: $id, status: $statusStr",
+      ); // DEBUG
+
+      // --- ROBUST FIND & UPDATE ---
+      Message? messageToUpdate;
+
+      // Find the message across all contacts
+      for (var contact in contacts.values) {
+        try {
+          messageToUpdate = contact.history.firstWhere((m) => m.localId == id);
+          break; // Found it
+        } catch (e) {
+          // Not in this contact, continue
         }
       }
-    }
-    else if (type == 'new_message') {
-      final sender = payload['sender'];
-      final eventType = payload['type']; // text, media, edit, delete
+
+      if (messageToUpdate != null) {
+        print("[Flutter] Found message to update!");
+        MessageStatus newStatus = (statusStr == "sent")
+            ? MessageStatus.sent
+            : MessageStatus.failed;
+
+        // Only update if status has changed
+        if (messageToUpdate.status != newStatus) {
+          messageToUpdate.status = newStatus;
+          notifyListeners(); // Trigger UI rebuild
+        }
+      } else {
+        print("[Flutter] ACK received but no matching local_id found: $id");
+      }
+    } else if (type == 'new_message') {
+      final sender = payload['sender'] as String;
+      final eventType = payload['type'] as String?;
 
       if (eventType == 'edit') {
-        // Edit existing message
-        String relatedUuid = payload['related_uuid']; // ID of message to edit
+        String relatedUuid = payload['related_uuid'];
         String newBody = payload['body'];
         _processEdit(sender, relatedUuid, newBody);
-      } 
-      else if (eventType == 'delete') {
-        // Delete message
+      } else if (eventType == 'delete') {
         String relatedUuid = payload['related_uuid'];
         _processDelete(sender, relatedUuid);
-      } else if (type == 'file_data') {
-      // payload: { path: "...", data_b64: "..." }
-      String path = payload['path'];
-      String b64 = payload['data_b64'];
-      
-      // Decode and cache
-      _mediaCache[path] = base64Decode(b64);
-      notifyListeners();
-    }
-      else {
-        // Normal New Message
-        final body = payload['body'] ?? "";
+      } else {
+        // New Text or Media message
+        String body = payload['body'] ?? "";
         String content = body;
-        if (eventType == 'media') content = "downloads/${payload['filename']}";
+        bool isFile = false;
+
+        if (eventType == 'media') {
+          String filename = payload['filename'];
+          String localPath = "downloads/$filename";
+
+          // Request the media content immediately
+          requestMedia(localPath);
+
+          content = filename; // Store only filename in the message content
+          isFile = true;
+        }
 
         _addMessage(
           sender,
           Message(
-            uuid: payload['uuid'] ?? "", 
+            uuid: payload['uuid'] ?? "",
             replyTo: payload['reply_to'],
             localId: "", // Not needed for incoming
             sender: sender,
             content: content,
             isMine: false,
-            isFile: eventType == 'media',
+            isFile: isFile,
             timestamp: payload['timestamp'].toString(),
             type: eventType ?? 'text',
-            status: MessageStatus.received
+            status: MessageStatus.received,
           ),
         );
       }
-    } 
-    else if (type == 'sync_response') {
+    } else if (type == 'sync_response') {
       _hasSynced = true;
       if (payload['contacts'] != null) {
         contacts.clear();
@@ -362,7 +389,7 @@ class ChatProvider extends ChangeNotifier {
       contacts[contactName] = Contact(contactName);
     }
     contacts[contactName]!.history.add(msg);
-    
+
     if (activeContactName != contactName && !msg.isMine) {
       contacts[contactName]!.unreadCount++;
     }
@@ -376,10 +403,16 @@ class ChatProvider extends ChangeNotifier {
       if (idx != -1) {
         var old = history[idx];
         history[idx] = Message(
-          uuid: old.uuid, replyTo: old.replyTo, localId: old.localId,
-          sender: old.sender, isMine: old.isMine, isFile: old.isFile,
-          timestamp: old.timestamp, type: old.type, status: old.status,
-          content: newText // Updated
+          uuid: old.uuid,
+          replyTo: old.replyTo,
+          localId: old.localId,
+          sender: old.sender,
+          isMine: old.isMine,
+          isFile: old.isFile,
+          timestamp: old.timestamp,
+          type: old.type,
+          status: old.status,
+          content: newText, // Updated
         );
         notifyListeners();
       }
@@ -409,30 +442,30 @@ class ChatProvider extends ChangeNotifier {
 
   void sendStagedFile() {
     if (activeContactName == null || stagedFilepath == null) return;
-    
+
     // Pass caption to daemon
     // NOTE: We need to update IPC `upload_file` to accept a caption!
     _daemon.sendCommand('upload_file', {
       'target': activeContactName,
       'filepath': stagedFilepath,
-      'caption': stagedCaption
+      'caption': stagedCaption,
     });
 
     // Optimistic UI Update (Show file as sending)
     _addMessage(
-      activeContactName!, 
+      activeContactName!,
       Message(
-        uuid: const Uuid().v4(), 
+        uuid: const Uuid().v4(),
         localId: "${DateTime.now().millisecondsSinceEpoch}",
-        sender: "Me", 
+        sender: "Me",
         // Use filename as content
-        content: stagedFilepath!.split('/').last, 
-        isMine: true, 
-        isFile: true, 
-        timestamp: DateTime.now().toString(), 
-        type: 'media', 
-        status: MessageStatus.sending
-      )
+        content: stagedFilepath!.split('/').last,
+        isMine: true,
+        isFile: true,
+        timestamp: DateTime.now().toString(),
+        type: 'media',
+        status: MessageStatus.sending,
+      ),
     );
 
     unstageFile(); // Clear input

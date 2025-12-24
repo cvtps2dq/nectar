@@ -107,9 +107,8 @@ class MessageBubble extends StatelessWidget {
     final chat = context.read<ChatProvider>();
     final isMe = msg.isMine;
 
-    // 1. If it's Media
     if (msg.type == 'media') {
-      final String filename = msg.content.split('/').last;
+      final String filename = msg.content; // Content is now just the filename
       final String localPath = "downloads/$filename";
 
       bool isImage =
@@ -119,7 +118,6 @@ class MessageBubble extends StatelessWidget {
           filename.toLowerCase().endsWith('.gif');
 
       if (isImage) {
-        // Check our in-memory cache
         final imageData = chat.getMedia(localPath);
 
         if (imageData != null) {
@@ -129,50 +127,24 @@ class MessageBubble extends StatelessWidget {
             child: Image.memory(imageData, height: 200, fit: BoxFit.cover),
           );
         } else {
-          // B. Image not loaded, show "Tap to load" placeholder.
-          return GestureDetector(
-            onTap: () {
-              print("[UI] Requesting media: $localPath");
-              chat.requestMedia(localPath);
-            },
-            child: Container(
-              height: 120,
-              width: 200,
-              decoration: BoxDecoration(
-                color: Colors.black26,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(
-                    Icons.downloading,
-                    color: NeuColors.accent,
-                    size: 32,
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "Tap to load image",
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: NeuColors.textSecondary,
-                    ),
-                  ),
-                  Text(
-                    filename,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      color: NeuColors.textSecondary,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+          // B. Image is being downloaded, show a spinner.
+          return Container(
+            height: 120,
+            width: 200,
+            decoration: BoxDecoration(
+              color: Colors.black26,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Center(
+              child: CircularProgressIndicator(
+                color: NeuColors.accent,
+                strokeWidth: 2,
               ),
             ),
           );
         }
       } else {
-        // C. It's a generic file, not an image.
+        // C. It's a generic file.
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -189,14 +161,11 @@ class MessageBubble extends StatelessWidget {
       }
     }
 
-    // 2. If it's plain text
+    // It's plain text
     return Text(
       msg.content,
       style: TextStyle(
-        color: isMe
-            ? NeuColors.textPrimary
-            : NeuColors.textPrimary, // Unified text color for dark mode
-        fontSize: 15,
+        color: isMe ? NeuColors.textPrimary : NeuColors.textPrimary,
       ),
     );
   }
